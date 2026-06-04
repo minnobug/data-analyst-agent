@@ -1,0 +1,37 @@
+# Environment & secrets
+.env
+.env.*
+*.env
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data files (thường lớn, không commit)
+data/raw/
+data/output/
+*.csv
+*.parquet
+*.db
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
