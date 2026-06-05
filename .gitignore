@@ -16,7 +16,7 @@ dist/
 build/
 .eggs/
 
-# Data files (thường lớn, không commit)
+# Data files 
 data/raw/
 data/output/
 *.csv
