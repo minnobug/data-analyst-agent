@@ -19,12 +19,13 @@ build/
 # Data files 
 data/raw/
 data/output/
+data/sample/
 *.csv
 *.parquet
 *.db
 
 # IDE
-.vscode/settings.json
+.vscode/
 .idea/
 *.swp
 
@@ -35,3 +36,5 @@ Thumbs.db
 # Logs
 logs/
 *.log
+
+get-pip.py
