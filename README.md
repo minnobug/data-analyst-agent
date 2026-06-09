@@ -1,98 +1,130 @@
-# 🤖 Data Analyst Agent
+# Data Analyst Agent
 
-> AI agent phân tích dữ liệu bằng ngôn ngữ tự nhiên — hỏi bằng tiếng Việt hay tiếng Anh, agent tự viết SQL và trả kết quả.
+AI agent that answers questions about your data in plain English or Vietnamese — no SQL knowledge needed.
 
-Built with **Groq (Llama 3.3 70B)** + **LangChain** + **DuckDB**
-
----
-
-## ✨ Features
-
-- 💬 Natural language to SQL — không cần biết SQL
-- 🇻🇳 Hỗ trợ tiếng Việt
-- ⚡ Groq inference cực nhanh (Llama 3.3 70B)
-- 🦆 DuckDB local warehouse — không cần server
-- 🔄 Agentic loop — tự kiểm tra schema trước khi query
-- 🛡️ Tự xử lý lỗi INT32 overflow khi tính doanh thu lớn
+[![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
+[![CI](https://github.com/minnobug/data-analyst-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/minnobug/data-analyst-agent/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 ---
 
-## 🗂️ Project Structure
+## What it does
+
+Ask questions in natural language → agent writes and runs SQL → returns the answer.
+
+```
+You:   Sản phẩm nào bán chạy nhất?
+Agent: Phone — 75 units sold across all cities.
+
+You:   Total revenue by city?
+Agent: Danang 2.4B  |  Hanoi 3.0B  |  HCMC 5.7B
+```
+
+Supports **English and Vietnamese** out of the box.
+
+---
+
+## Stack
+
+| Layer | Tool |
+|---|---|
+| LLM | Groq — Llama 3.3 70B |
+| Agent framework | LangChain |
+| Database | DuckDB |
+| CLI | Rich |
+| Retry / resilience | Tenacity |
+
+---
+
+## Project structure
 
 ```
 data-analyst-agent/
 ├── src/
 │   ├── agent/
-│   │   └── agent.py        # LangChain agent + fallback error handler
-│   └── tools/
-│       ├── sql_tool.py     # DuckDB query + list_tables tools
-│       └── file_tool.py    # (extensible)
+│   │   └── agent.py          # LangChain agentic loop + Groq integration
+│   ├── tools/
+│   │   ├── sql_tool.py       # query_sql and list_tables tools (DuckDB)
+│   │   └── file_tool.py      # extensible file ingestion (WIP)
+│   └── logging_config.py     # JSON structured logger
 ├── tests/
-├── main.py                 # Entry point
+│   ├── conftest.py            # stubs for all external deps (no live services needed)
+│   ├── test_agent.py          # 43 cases — agent loop, retry, fallback XML
+│   ├── test_sql_tool.py       # 47 cases — sanitize, overflow rewrite, conn lifecycle
+│   └── test_logging_config.py # 26 cases — JsonFormatter, extra fields, LOG_LEVEL
+├── data/sample/
+│   └── warehouse.db           # auto-created on first run
+├── main.py                    # entry point
 ├── pyproject.toml
 └── .env.example
 ```
 
 ---
 
-## 🚀 Setup
+## Quick start
 
-**1. Clone & cài dependencies**
+**1. Clone and install**
 ```bash
 git clone https://github.com/minnobug/data-analyst-agent.git
 cd data-analyst-agent
 pip install -e .
 ```
 
-**2. Tạo file `.env`**
+**2. Set up environment**
 ```bash
 cp .env.example .env
+# Add your Groq API key — free at console.groq.com
 ```
 
-Thêm Groq API key vào `.env`:
-```
+```env
 GROQ_API_KEY=your_key_here
 GROQ_MODEL=llama-3.3-70b-versatile
+LOG_LEVEL=INFO
 ```
 
-> Lấy API key miễn phí tại [console.groq.com](https://console.groq.com)
-
-**3. Chạy**
+**3. Run**
 ```bash
 python main.py
 ```
 
 ---
 
-## 💡 Example Queries
+## Run tests
 
-```
-You: Sản phẩm nào bán chạy nhất?
-Agent: Sản phẩm bán chạy nhất là Phone với tổng số lượng 75.
+```bash
+# All 116 tests — no live services or API keys needed
+pytest tests/ -v
 
-You: Tổng doanh thu theo từng thành phố?
-Agent:
-  - Đà Nẵng: 2.400.000.000
-  - Hà Nội:  3.000.000.000
-  - TP.HCM:  5.700.000.000
-
-You: Tháng nào HCMC bán được nhiều nhất và sản phẩm gì?
-Agent: Tháng 2024-01 với sản phẩm Phone, doanh thu 3.600.000.000.
+# With coverage
+pytest tests/ --cov=src --cov-report=term-missing
 ```
 
 ---
 
-## 🛠️ Tech Stack
+## Configuration
 
-| Layer | Tool |
-|---|---|
-| LLM | Groq — Llama 3.3 70B Versatile |
-| Agent framework | LangChain |
-| Database | DuckDB |
-| CLI UI | Rich |
+| Env var | Default | Description |
+|---|---|---|
+| `GROQ_API_KEY` | required | Groq API key |
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Model to use |
+| `WAREHOUSE_DB` | `data/sample/warehouse.db` | Path to DuckDB file |
+| `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` |
 
 ---
 
-## 📄 License
+## Roadmap
 
-MIT
+- [x] Natural language → SQL (English + Vietnamese)
+- [x] DuckDB local warehouse
+- [x] Groq rate-limit retry with tenacity
+- [x] JSON structured logging
+- [x] 116 unit tests, CI on GitHub Actions
+- [ ] Connect to SmartCity pipeline (S3 Parquet via DuckDB httpfs)
+- [ ] File ingestion tool (CSV, Parquet upload)
+- [ ] Streamlit web UI
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE)
