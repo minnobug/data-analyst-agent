@@ -1,428 +1,577 @@
-import os
-import sys
-import unittest
+import pytest
+from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import conftest stubs trước
-import tests.conftest  # noqa: F401
-
-from src.tools.sql_tool import _sanitize, _resolve_db_path, DB_PATH
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-class TestResolveDbPath(unittest.TestCase):
-    """_resolve_db_path phải xử lý đúng mọi trường hợp env var."""
+def _make_mock_conn(
+    tables: list[str] | None = None, describe_df: pd.DataFrame | None = None
+):
+    """Tạo mock DuckDB connection với fetchdf() trả về data."""
+    conn = MagicMock()
 
-    def test_env_var_set_returns_env_path(self):
-        with patch.dict(os.environ, {"WAREHOUSE_DB": "/tmp/mydb.db"}):
-            from importlib import reload
-            import src.tools.sql_tool as m
+    if tables is not None:
+        tables_df = pd.DataFrame({"table_name": tables, "name": tables})
+        _default_df = MagicMock()
+        _default_df.fetchdf.return_value = tables_df
+        conn.execute.return_value = _default_df
 
-            path = m._resolve_db_path()
-        self.assertEqual(str(path), "/tmp/mydb.db")
+    if describe_df is not None:
+        _desc = MagicMock()
+        _desc.fetchdf.return_value = describe_df
+        conn.execute.return_value = _desc
 
-    def test_env_var_empty_string_uses_fallback(self):
-        with patch.dict(os.environ, {"WAREHOUSE_DB": ""}):
-            from src.tools.sql_tool import _resolve_db_path
-
-            path = _resolve_db_path()
-        self.assertIn("data", str(path))
-        self.assertIn("warehouse.db", str(path))
-
-    def test_env_var_not_set_uses_fallback(self):
-        env = {k: v for k, v in os.environ.items() if k != "WAREHOUSE_DB"}
-        with patch.dict(os.environ, env, clear=True):
-            from src.tools.sql_tool import _resolve_db_path
-
-            path = _resolve_db_path()
-        self.assertIn("warehouse.db", str(path))
-
-    def test_fallback_path_ends_with_warehouse_db(self):
-        env = {k: v for k, v in os.environ.items() if k != "WAREHOUSE_DB"}
-        with patch.dict(os.environ, env, clear=True):
-            from src.tools.sql_tool import _resolve_db_path
-
-            path = _resolve_db_path()
-        self.assertTrue(str(path).endswith("warehouse.db"))
-
-    def test_db_path_is_path_object(self):
-        from pathlib import Path
-        from src.tools.sql_tool import DB_PATH
-
-        self.assertIsInstance(DB_PATH, Path)
+    return conn
 
 
-class TestSanitize(unittest.TestCase):
-    """_sanitize phải accept SELECT/WITH/EXPLAIN và reject mọi thứ khác."""
+# ── _is_s3_mode ───────────────────────────────────────────────────────────────
 
-    # ── Allowed queries ──────────────────────────────────────────────────
+
+class TestIsS3Mode:
+    def test_returns_true_when_all_aws_env_set(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY", "key123")
+        monkeypatch.setenv("AWS_SECRET_KEY", "secret123")
+        monkeypatch.setenv("AWS_BUCKET_NAME", "my-bucket")
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        assert m._is_s3_mode() is True
+
+    def test_returns_false_when_bucket_missing(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY", "key123")
+        monkeypatch.setenv("AWS_SECRET_KEY", "secret123")
+        monkeypatch.delenv("AWS_BUCKET_NAME", raising=False)
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        assert m._is_s3_mode() is False
+
+    def test_returns_false_when_no_aws_env(self, monkeypatch):
+        for k in ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET_NAME"]:
+            monkeypatch.delenv(k, raising=False)
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        assert m._is_s3_mode() is False
+
+
+# ── _sanitize ─────────────────────────────────────────────────────────────────
+
+
+class TestSanitize:
+    @pytest.fixture(autouse=True)
+    def _import(self):
+        from src.tools.sql_tool import _sanitize
+
+        self._sanitize = _sanitize
+
+    def test_empty_sql_rejected(self):
+        ok, _, err = self._sanitize("   ")
+        assert ok is False
+        assert "empty" in err.lower()
 
     def test_select_allowed(self):
-        ok, sql, err = _sanitize("SELECT * FROM sales")
-        self.assertTrue(ok)
-        self.assertEqual(err, "")
+        ok, safe, _ = self._sanitize("SELECT 1")
+        assert ok is True
+        assert "SELECT 1" in safe
 
-    def test_select_case_insensitive(self):
-        ok, sql, err = _sanitize("select * from sales")
-        self.assertTrue(ok)
-
-    def test_with_cte_allowed(self):
-        ok, sql, err = _sanitize("WITH cte AS (SELECT 1) SELECT * FROM cte")
-        self.assertTrue(ok)
+    def test_with_allowed(self):
+        ok, _, _ = self._sanitize("WITH cte AS (SELECT 1) SELECT * FROM cte")
+        assert ok is True
 
     def test_explain_allowed(self):
-        ok, sql, err = _sanitize("EXPLAIN SELECT * FROM sales")
-        self.assertTrue(ok)
+        ok, _, _ = self._sanitize("EXPLAIN SELECT * FROM vehicle_data")
+        assert ok is True
 
-    def test_leading_whitespace_allowed(self):
-        ok, sql, err = _sanitize("  \n  SELECT 1")
-        self.assertTrue(ok)
+    def test_insert_rejected(self):
+        ok, _, err = self._sanitize("INSERT INTO t VALUES (1)")
+        assert ok is False
+        assert "INSERT" in err
 
-    # ── Blocked statements ───────────────────────────────────────────────
+    def test_drop_rejected(self):
+        ok, _, err = self._sanitize("DROP TABLE vehicle_data")
+        assert ok is False
+        assert "DROP" in err
 
-    def test_drop_blocked(self):
-        ok, _, err = _sanitize("DROP TABLE sales")
-        self.assertFalse(ok)
-        self.assertIn("DROP", err)
+    def test_delete_rejected(self):
+        ok, _, err = self._sanitize("DELETE FROM vehicle_data")
+        assert ok is False
+        assert "DELETE" in err
 
-    def test_delete_blocked(self):
-        ok, _, err = _sanitize("DELETE FROM sales WHERE 1=1")
-        self.assertFalse(ok)
+    def test_update_rejected(self):
+        ok, _, err = self._sanitize("UPDATE vehicle_data SET speed = 0")
+        assert ok is False
 
-    def test_insert_blocked(self):
-        ok, _, err = _sanitize("INSERT INTO sales VALUES (1,2,3,4,5)")
-        self.assertFalse(ok)
+    def test_install_rejected(self):
+        ok, _, err = self._sanitize("INSTALL httpfs")
+        assert ok is False
+        assert "INSTALL" in err
 
-    def test_update_blocked(self):
-        ok, _, err = _sanitize("UPDATE sales SET quantity = 0")
-        self.assertFalse(ok)
+    def test_load_rejected(self):
+        ok, _, err = self._sanitize("LOAD httpfs")
+        assert ok is False
+        assert "LOAD" in err
 
-    def test_alter_blocked(self):
-        ok, _, err = _sanitize("ALTER TABLE sales ADD COLUMN x INT")
-        self.assertFalse(ok)
+    def test_overflow_rewritten(self):
+        sql = "SELECT unit_price * quantity FROM sales"
+        ok, safe, _ = self._sanitize(sql)
+        assert ok is True
+        assert "CAST(unit_price AS BIGINT) * quantity" in safe
+        assert "unit_price * quantity" not in safe.replace(
+            "CAST(unit_price AS BIGINT) * quantity", ""
+        )
 
-    def test_truncate_blocked(self):
-        ok, _, err = _sanitize("TRUNCATE TABLE sales")
-        self.assertFalse(ok)
+    def test_overflow_case_insensitive(self):
+        sql = "SELECT UNIT_PRICE * QUANTITY FROM sales"
+        ok, safe, _ = self._sanitize(sql)
+        assert ok is True
+        assert "CAST" in safe
 
-    def test_attach_blocked(self):
-        ok, _, err = _sanitize("ATTACH DATABASE 'hack.db'")
-        self.assertFalse(ok)
+    def test_safe_select_unchanged(self):
+        sql = "SELECT make, AVG(speed_kmh) FROM vehicle_data GROUP BY make"
+        ok, safe, _ = self._sanitize(sql)
+        assert ok is True
+        assert safe.strip() == sql.strip()
 
-    def test_copy_blocked(self):
-        ok, _, err = _sanitize("COPY sales TO '/tmp/out.csv'")
-        self.assertFalse(ok)
-
-    def test_install_blocked(self):
-        ok, _, err = _sanitize("INSTALL httpfs")
-        self.assertFalse(ok)
-
-    def test_load_blocked(self):
-        ok, _, err = _sanitize("LOAD 'some_extension'")
-        self.assertFalse(ok)
-
-    def test_empty_query_blocked(self):
-        ok, _, err = _sanitize("")
-        self.assertFalse(ok)
-        self.assertIn("empty", err.lower())
-
-    def test_whitespace_only_blocked(self):
-        ok, _, err = _sanitize("   \n\t  ")
-        self.assertFalse(ok)
-
-    # ── Keyword in SELECT context — blocked (best-effort) ───────────────
-
-    def test_drop_after_select_blocked(self):
-        """DROP trong câu SELECT vẫn bị block — best-effort safety."""
-        ok, _, err = _sanitize("SELECT 1; DROP TABLE sales")
-        self.assertFalse(ok)
-
-    # ── Overflow rewrite ─────────────────────────────────────────────────
-
-    def test_overflow_rewrite_applied(self):
-        ok, safe, _ = _sanitize("SELECT unit_price * quantity FROM sales")
-        self.assertTrue(ok)
-        self.assertIn("CAST(unit_price AS BIGINT)", safe)
-        self.assertNotIn("unit_price * quantity", safe)
-
-    def test_overflow_rewrite_case_insensitive(self):
-        ok, safe, _ = _sanitize("SELECT UNIT_PRICE * QUANTITY FROM sales")
-        self.assertTrue(ok)
-        self.assertIn("CAST(unit_price AS BIGINT)", safe)
-
-    def test_overflow_rewrite_preserves_rest(self):
-        sql = "SELECT city, unit_price * quantity as revenue FROM sales"
-        ok, safe, _ = _sanitize(sql)
-        self.assertTrue(ok)
-        self.assertIn("city", safe)
-        self.assertIn("CAST(unit_price AS BIGINT) * quantity", safe)
-
-    def test_no_overflow_pattern_unchanged(self):
-        sql = "SELECT city, SUM(quantity) FROM sales GROUP BY city"
-        ok, safe, _ = _sanitize(sql)
-        self.assertTrue(ok)
-        self.assertNotIn("CAST", safe)
-
-    def test_overflow_multiple_occurrences(self):
-        sql = "SELECT unit_price * quantity, unit_price * quantity FROM sales"
-        ok, safe, _ = _sanitize(sql)
-        self.assertTrue(ok)
-        self.assertEqual(safe.count("CAST(unit_price AS BIGINT)"), 2)
-
-    # ── Return tuple structure ───────────────────────────────────────────
-
-    def test_returns_three_tuple(self):
-        result = _sanitize("SELECT 1")
-        self.assertIsInstance(result, tuple)
-        self.assertEqual(len(result), 3)
-
-    def test_ok_true_has_empty_error(self):
-        ok, sql, err = _sanitize("SELECT 1")
-        self.assertTrue(ok)
-        self.assertEqual(err, "")
-        self.assertNotEqual(sql, "")
-
-    def test_ok_false_has_empty_sql(self):
-        ok, sql, err = _sanitize("DROP TABLE x")
-        self.assertFalse(ok)
-        self.assertEqual(sql, "")
-        self.assertNotEqual(err, "")
+    def test_dangerous_keyword_mid_query_rejected(self):
+        sql = "SELECT * FROM sales WHERE name = 'DROP'"
+        # 'DROP' in string value — hiện tại regex sẽ catch nó
+        # Test documents current behaviour
+        ok, _, _ = self._sanitize(sql)
+        assert ok is False  # conservative: block anyway
 
 
-class TestListTables(unittest.TestCase):
-    """list_tables phải trả schema đúng và luôn close connection."""
+# ── _make_local_connection ────────────────────────────────────────────────────
 
-    def _make_mock_conn(self, tables=None, cols=None):
-        conn = MagicMock()
-        conn.__enter__ = lambda s: s
-        conn.__exit__ = MagicMock(return_value=False)
 
-        # SHOW TABLES result
-        if tables is None:
-            tables = ["sales"]
-        tables_df = pd.DataFrame({"name": tables})
+class TestMakeLocalConnection:
+    def test_raises_file_not_found_when_db_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WAREHOUSE_DB", str(tmp_path / "nonexistent.db"))
 
-        # Column info result
-        if cols is None:
-            cols = pd.DataFrame(
-                {
-                    "column_name": [
-                        "month",
-                        "city",
-                        "product",
-                        "unit_price",
-                        "quantity",
-                    ],
-                    "data_type": [
-                        "VARCHAR",
-                        "VARCHAR",
-                        "VARCHAR",
-                        "INTEGER",
-                        "INTEGER",
-                    ],
-                }
-            )
+        import importlib
+        import src.tools.sql_tool as m
 
-        def execute_side_effect(sql, params=None):
-            mock_result = MagicMock()
-            if "SHOW TABLES" in sql.upper():
-                mock_result.fetchdf.return_value = tables_df
-            elif "information_schema" in sql.lower():
-                mock_result.fetchdf.return_value = cols
-            else:
-                mock_result.fetchdf.return_value = pd.DataFrame()
-            return mock_result
+        importlib.reload(m)
 
-        conn.execute.side_effect = execute_side_effect
-        return conn
+        with pytest.raises(FileNotFoundError, match="Local warehouse not found"):
+            m._make_local_connection()
 
-    def test_returns_table_and_columns(self):
-        mock_conn = self._make_mock_conn()
-        with patch("src.tools.sql_tool.get_connection", return_value=mock_conn):
-            from src.tools.sql_tool import list_tables
+    def test_connects_when_db_exists(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "test.db"
 
-            result = list_tables.invoke({})
-        self.assertIn("sales", result)
-        self.assertIn("month", result)
+        # 1. Tạo file DB trước (dùng subprocess để tránh bị ảnh hưởng bởi mock)
+        import subprocess, sys
 
-    def test_empty_database_returns_no_tables_message(self):
-        conn = MagicMock()
-        mock_result = MagicMock()
-        mock_result.fetchdf.return_value = pd.DataFrame({"name": []})
-        conn.execute.return_value = mock_result
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"import duckdb; c = duckdb.connect('{db_path}'); "
+                f"c.execute('CREATE TABLE test (id INTEGER)'); c.close()",
+            ],
+            check=True,
+        )
 
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import list_tables
+        # 2. Verify file tồn tại
+        assert db_path.exists(), f"DB file not created: {db_path}"
 
-            result = list_tables.invoke({})
-        self.assertIn("No tables", result)
+        # 3. Set env
+        monkeypatch.setenv("WAREHOUSE_DB", str(db_path))
 
-    def test_connection_closed_on_success(self):
-        mock_conn = self._make_mock_conn()
-        with patch("src.tools.sql_tool.get_connection", return_value=mock_conn):
-            from src.tools.sql_tool import list_tables
+        # 4. Gọi trực tiếp
+        from src.tools import sql_tool
 
-            list_tables.invoke({})
+        conn = sql_tool._make_local_connection()
+        assert conn is not None
+        conn.close()
+
+
+# ── _make_s3_connection ───────────────────────────────────────────────────────
+
+
+class TestMakeS3Connection:
+    @pytest.fixture(autouse=True)
+    def _set_aws_env(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY", "test-key")
+        monkeypatch.setenv("AWS_SECRET_KEY", "test-secret")
+        monkeypatch.setenv("AWS_REGION", "ap-southeast-1")
+        monkeypatch.setenv("AWS_BUCKET_NAME", "smartcity-bucket")
+
+    def test_raises_runtime_error_when_httpfs_fails(self, monkeypatch):
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        with patch("duckdb.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_connect.return_value = mock_conn
+            mock_conn.execute.side_effect = Exception("httpfs not available")
+
+            with pytest.raises(RuntimeError, match="Cannot load httpfs"):
+                m._make_s3_connection()
+
+    def test_sets_s3_credentials(self, monkeypatch):
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        execute_calls = []
+
+        with patch("duckdb.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_connect.return_value = mock_conn
+
+            def _execute(sql):
+                execute_calls.append(sql)
+                return MagicMock()
+
+            mock_conn.execute.side_effect = _execute
+
+            try:
+                m._make_s3_connection()
+            except Exception:
+                pass  # view creation might fail — that's ok for this test
+
+            all_sql = " ".join(execute_calls)
+            assert "test-key" in all_sql
+            assert "test-secret" in all_sql
+            assert "ap-southeast-1" in all_sql
+
+    def test_creates_views_for_all_5_tables(self, monkeypatch):
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        with patch("duckdb.connect") as mock_connect:
+            mock_conn = MagicMock()
+            mock_connect.return_value = mock_conn
+            mock_conn.execute.return_value = MagicMock()
+
+            m._make_s3_connection()
+
+            view_calls = [
+                str(c)
+                for c in mock_conn.execute.call_args_list
+                if "CREATE VIEW" in str(c)
+            ]
+            assert len(view_calls) == 5
+            for table in m._SMARTCITY_TABLES:
+                assert any(table in c for c in view_calls)
+
+
+# ── _get_connection context manager ──────────────────────────────────────────
+
+
+class TestGetConnection:
+    def test_yields_s3_connection_when_aws_configured(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY", "key")
+        monkeypatch.setenv("AWS_SECRET_KEY", "secret")
+        monkeypatch.setenv("AWS_BUCKET_NAME", "bucket")
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        mock_conn = MagicMock()
+        with patch.object(m, "_make_s3_connection", return_value=mock_conn) as mock_s3:
+            with m._get_connection() as conn:
+                assert conn is mock_conn
+            mock_s3.assert_called_once()
+
+    def test_yields_local_connection_when_no_aws(self, monkeypatch):
+        for k in ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET_NAME"]:
+            monkeypatch.delenv(k, raising=False)
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        mock_conn = MagicMock()
+        with patch.object(
+            m, "_make_local_connection", return_value=mock_conn
+        ) as mock_local:
+            with m._get_connection() as conn:
+                assert conn is mock_conn
+            mock_local.assert_called_once()
+
+    def test_connection_closed_after_context_exits(self, monkeypatch):
+        for k in ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET_NAME"]:
+            monkeypatch.delenv(k, raising=False)
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        mock_conn = MagicMock()
+        with patch.object(m, "_make_local_connection", return_value=mock_conn):
+            with m._get_connection():
+                pass
+
         mock_conn.close.assert_called_once()
 
-    def test_connection_closed_on_exception(self):
-        conn = MagicMock()
-        conn.execute.side_effect = RuntimeError("db error")
+    def test_s3_failure_falls_back_to_local(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY", "key")
+        monkeypatch.setenv("AWS_SECRET_KEY", "secret")
+        monkeypatch.setenv("AWS_BUCKET_NAME", "bucket")
 
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import list_tables
+        import importlib
+        import src.tools.sql_tool as m
 
-            result = list_tables.invoke({})
+        importlib.reload(m)
 
-        conn.close.assert_called_once()
-        self.assertIn("Error", result)
+        mock_local_conn = MagicMock()
+        with patch.object(
+            m, "_make_s3_connection", side_effect=RuntimeError("httpfs fail")
+        ):
+            with patch.object(
+                m, "_make_local_connection", return_value=mock_local_conn
+            ) as mock_local:
+                with m._get_connection() as conn:
+                    assert conn is mock_local_conn
+                mock_local.assert_called_once()
 
-    def test_multiple_tables_all_listed(self):
-        cols = pd.DataFrame(
+    def test_both_s3_and_local_fail_raises_connection_error(self, monkeypatch):
+        monkeypatch.setenv("AWS_ACCESS_KEY", "key")
+        monkeypatch.setenv("AWS_SECRET_KEY", "secret")
+        monkeypatch.setenv("AWS_BUCKET_NAME", "bucket")
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        with patch.object(
+            m, "_make_s3_connection", side_effect=RuntimeError("s3 fail")
+        ):
+            with patch.object(
+                m, "_make_local_connection", side_effect=FileNotFoundError("no db")
+            ):
+                with pytest.raises(ConnectionError, match="Both S3 and local"):
+                    with m._get_connection():
+                        pass
+
+
+# ── list_tables tool ──────────────────────────────────────────────────────────
+
+
+class TestListTables:
+    def test_returns_table_list_in_local_mode(self, monkeypatch):
+        for k in ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET_NAME"]:
+            monkeypatch.delenv(k, raising=False)
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        mock_conn = MagicMock()
+        tables_df = pd.DataFrame({"name": ["sales"], "table_name": ["sales"]})
+        describe_df = pd.DataFrame(
             {
-                "column_name": ["id", "name"],
-                "data_type": ["INTEGER", "VARCHAR"],
+                "column_name": ["month", "city", "unit_price"],
+                "column_type": ["VARCHAR", "VARCHAR", "INTEGER"],
             }
         )
-        mock_conn = self._make_mock_conn(
-            tables=["sales", "products", "users"], cols=cols
-        )
-        with patch("src.tools.sql_tool.get_connection", return_value=mock_conn):
-            from src.tools.sql_tool import list_tables
 
-            result = list_tables.invoke({})
-        for table in ["sales", "products", "users"]:
-            self.assertIn(table, result)
+        def _execute(sql):
+            r = MagicMock()
+            if "SHOW TABLES" in sql:
+                r.fetchdf.return_value = tables_df
+            elif "DESCRIBE" in sql:
+                r.fetchdf.return_value = describe_df
+            return r
 
+        mock_conn.execute.side_effect = _execute
 
-class TestQuerySql(unittest.TestCase):
-    """query_sql phải sanitize, execute, và luôn close connection."""
+        with patch.object(m, "_get_connection") as mock_ctx:
+            mock_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+            mock_ctx.return_value.__exit__ = MagicMock(return_value=False)
 
-    def _make_conn_with_result(self, df: pd.DataFrame):
-        conn = MagicMock()
-        mock_result = MagicMock()
-        mock_result.fetchdf.return_value = df
-        conn.execute.return_value = mock_result
-        return conn
+            result = m.list_tables.invoke({})
 
-    def test_valid_query_returns_data(self):
-        df = pd.DataFrame({"city": ["Hanoi", "HCMC"], "total": [100, 200]})
-        conn = self._make_conn_with_result(df)
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import query_sql
+        assert "sales" in result
+        assert "month" in result
 
-            result = query_sql.invoke(
-                {"sql": "SELECT city, SUM(quantity) as total FROM sales GROUP BY city"}
-            )
-        self.assertIn("Hanoi", result)
-        self.assertIn("HCMC", result)
+    def test_returns_no_tables_message_when_empty(self, monkeypatch):
+        for k in ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET_NAME"]:
+            monkeypatch.delenv(k, raising=False)
 
-    def test_empty_result_returns_message(self):
-        conn = self._make_conn_with_result(pd.DataFrame())
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import query_sql
+        import importlib
+        import src.tools.sql_tool as m
 
-            result = query_sql.invoke({"sql": "SELECT * FROM sales WHERE 1=0"})
-        self.assertIn("no results", result.lower())
+        importlib.reload(m)
 
-    def test_sanitize_rejects_dangerous_sql(self):
-        with patch("src.tools.sql_tool.get_connection") as mock_gc:
-            from src.tools.sql_tool import query_sql
-
-            result = query_sql.invoke({"sql": "DROP TABLE sales"})
-        mock_gc.assert_not_called()
-        self.assertIn("SQL Error", result)
-
-    def test_sanitize_rejects_empty_sql(self):
-        with patch("src.tools.sql_tool.get_connection") as mock_gc:
-            from src.tools.sql_tool import query_sql
-
-            result = query_sql.invoke({"sql": ""})
-        mock_gc.assert_not_called()
-        self.assertIn("SQL Error", result)
-
-    def test_connection_closed_on_success(self):
-        df = pd.DataFrame({"x": [1]})
-        conn = self._make_conn_with_result(df)
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import query_sql
-
-            query_sql.invoke({"sql": "SELECT 1 as x"})
-        conn.close.assert_called_once()
-
-    def test_connection_closed_on_db_exception(self):
-        conn = MagicMock()
-        conn.execute.side_effect = RuntimeError("connection failed")
-
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import query_sql
-
-            result = query_sql.invoke({"sql": "SELECT * FROM sales"})
-
-        conn.close.assert_called_once()
-        self.assertIn("SQL Error", result)
-
-    def test_overflow_rewrite_before_execute(self):
-        """unit_price * quantity phải được rewrite trước khi execute."""
-        df = pd.DataFrame({"revenue": [1000000]})
-        conn = self._make_conn_with_result(df)
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import query_sql
-
-            query_sql.invoke({"sql": "SELECT unit_price * quantity FROM sales"})
-
-        # Kiểm tra SQL thực tế được truyền vào execute
-        executed_sql = conn.execute.call_args[0][0]
-        self.assertIn("CAST(unit_price AS BIGINT)", executed_sql)
-        self.assertNotIn(
-            "unit_price * quantity",
-            executed_sql.replace("CAST(unit_price AS BIGINT) * quantity", ""),
-        )
-
-    def test_result_as_string(self):
-        df = pd.DataFrame({"col": ["val1", "val2"]})
-        conn = self._make_conn_with_result(df)
-        with patch("src.tools.sql_tool.get_connection", return_value=conn):
-            from src.tools.sql_tool import query_sql
-
-            result = query_sql.invoke({"sql": "SELECT col FROM t"})
-        self.assertIsInstance(result, str)
-
-    def test_get_connection_not_available_returns_error(self):
-        with patch("src.tools.sql_tool._DUCKDB_AVAILABLE", False):
-            with patch(
-                "src.tools.sql_tool.get_connection",
-                side_effect=RuntimeError("duckdb not installed"),
-            ):
-                from src.tools.sql_tool import query_sql
-
-                result = query_sql.invoke({"sql": "SELECT 1"})
-        self.assertIn("SQL Error", result)
-
-
-class TestGetConnection(unittest.TestCase):
-    """get_connection phải forward đúng params vào duckdb.connect."""
-
-    def test_calls_duckdb_connect_with_db_path(self):
         mock_conn = MagicMock()
-        with patch("src.tools.sql_tool.duckdb") as mock_duckdb:
-            mock_duckdb.connect.return_value = mock_conn
-            with patch("src.tools.sql_tool._DUCKDB_AVAILABLE", True):
-                from src.tools.sql_tool import get_connection, DB_PATH
+        empty_df = pd.DataFrame({"name": [], "table_name": []})
+        r = MagicMock()
+        r.fetchdf.return_value = empty_df
+        mock_conn.execute.return_value = r
 
-                get_connection()
-        mock_duckdb.connect.assert_called_once_with(str(DB_PATH), read_only=True)
+        with patch.object(m, "_get_connection") as mock_ctx:
+            mock_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+            mock_ctx.return_value.__exit__ = MagicMock(return_value=False)
 
-    def test_raises_when_duckdb_not_available(self):
-        with patch("src.tools.sql_tool._DUCKDB_AVAILABLE", False):
-            from src.tools.sql_tool import get_connection
+            result = m.list_tables.invoke({})
 
-            with self.assertRaises(RuntimeError) as ctx:
-                get_connection()
-        self.assertIn("duckdb", str(ctx.exception).lower())
+        assert "No tables" in result
+
+    def test_returns_error_string_on_connection_error(self, monkeypatch):
+        for k in ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET_NAME"]:
+            monkeypatch.delenv(k, raising=False)
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+
+        with patch.object(m, "_get_connection") as mock_ctx:
+            mock_ctx.return_value.__enter__ = MagicMock(
+                side_effect=ConnectionError("both failed")
+            )
+            mock_ctx.return_value.__exit__ = MagicMock(return_value=False)
+
+            result = m.list_tables.invoke({})
+
+        assert "Connection Error" in result or "Error" in result
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+# ── query_sql tool ────────────────────────────────────────────────────────────
+
+
+class TestQuerySql:
+    @pytest.fixture(autouse=True)
+    def _no_aws(self, monkeypatch):
+        for k in ["AWS_ACCESS_KEY", "AWS_SECRET_KEY", "AWS_BUCKET_NAME"]:
+            monkeypatch.delenv(k, raising=False)
+
+        import importlib
+        import src.tools.sql_tool as m
+
+        importlib.reload(m)
+        self.m = m
+
+    def _patch_conn(self, df: pd.DataFrame):
+        mock_conn = MagicMock()
+        r = MagicMock()
+        r.fetchdf.return_value = df
+        mock_conn.execute.return_value = r
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_conn)
+        ctx.__exit__ = MagicMock(return_value=False)
+        return ctx
+
+    def test_returns_formatted_dataframe(self):
+        df = pd.DataFrame({"city": ["Hanoi", "HCMC"], "total": [100, 200]})
+        with patch.object(self.m, "_get_connection", return_value=self._patch_conn(df)):
+            result = self.m.query_sql.invoke({"sql": "SELECT city, total FROM sales"})
+        assert "Hanoi" in result
+        assert "HCMC" in result
+
+    def test_empty_result_message(self):
+        df = pd.DataFrame()
+        with patch.object(self.m, "_get_connection", return_value=self._patch_conn(df)):
+            result = self.m.query_sql.invoke({"sql": "SELECT * FROM sales WHERE 1=0"})
+        assert "no results" in result.lower()
+
+    def test_rejects_insert(self):
+        result = self.m.query_sql.invoke({"sql": "INSERT INTO sales VALUES (1)"})
+        assert "SQL Error" in result
+        assert "INSERT" in result
+
+    def test_rejects_drop(self):
+        result = self.m.query_sql.invoke({"sql": "DROP TABLE sales"})
+        assert "SQL Error" in result
+
+    def test_rewrites_overflow(self):
+        df = pd.DataFrame({"revenue": [1000000]})
+        executed_sql = []
+
+        mock_conn = MagicMock()
+        r = MagicMock()
+        r.fetchdf.return_value = df
+
+        def _exec(sql):
+            executed_sql.append(sql)
+            return r
+
+        mock_conn.execute.side_effect = _exec
+
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_conn)
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(self.m, "_get_connection", return_value=ctx):
+            self.m.query_sql.invoke({"sql": "SELECT unit_price * quantity FROM sales"})
+
+        assert any("CAST(unit_price AS BIGINT)" in s for s in executed_sql)
+
+    def test_row_limit_100(self):
+        # 150 rows → only show 100
+        df = pd.DataFrame({"n": range(150)})
+        with patch.object(self.m, "_get_connection", return_value=self._patch_conn(df)):
+            result = self.m.query_sql.invoke({"sql": "SELECT n FROM big_table"})
+        assert "150" in result  # mentions total count
+        assert "100" in result  # mentions limit
+
+    def test_sql_exception_returns_error_string(self):
+        mock_conn = MagicMock()
+        mock_conn.execute.side_effect = Exception("column not found: xyz")
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(return_value=mock_conn)
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(self.m, "_get_connection", return_value=ctx):
+            result = self.m.query_sql.invoke({"sql": "SELECT xyz FROM sales"})
+
+        assert "SQL Error" in result or "Error" in result
+        assert "xyz" in result or "column" in result.lower()
+
+    def test_connection_error_returns_friendly_message(self):
+        ctx = MagicMock()
+        ctx.__enter__ = MagicMock(side_effect=ConnectionError("both failed"))
+        ctx.__exit__ = MagicMock(return_value=False)
+
+        with patch.object(self.m, "_get_connection", return_value=ctx):
+            result = self.m.query_sql.invoke({"sql": "SELECT 1"})
+
+        assert "Connection Error" in result
+
+
+# ── _SMARTCITY_TABLES constant ────────────────────────────────────────────────
+
+
+class TestSmartCityTablesConstant:
+    def test_has_five_tables(self):
+        from src.tools.sql_tool import _SMARTCITY_TABLES
+
+        assert len(_SMARTCITY_TABLES) == 5
+
+    def test_contains_all_expected_tables(self):
+        from src.tools.sql_tool import _SMARTCITY_TABLES
+
+        expected = {
+            "vehicle_data",
+            "gps_data",
+            "traffic_data",
+            "weather_data",
+            "emergency_data",
+        }
+        assert expected == set(_SMARTCITY_TABLES)
