@@ -5,8 +5,6 @@ import time
 import uuid
 
 from dotenv import load_dotenv
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 from rich.console import Console
 from tenacity import (
     retry,
@@ -124,10 +122,12 @@ except ImportError:
 
 
 def _is_rate_limit(exc: Exception) -> bool:
+    msg = str(exc).lower()
     return (
         isinstance(exc, _RETRY_ON)
-        or "429" in str(exc)
-        or "rate limit" in str(exc).lower()
+        or "429" in msg
+        or "rate limit" in msg
+        or "rate_limit" in msg
     )
 
 
@@ -137,7 +137,8 @@ _LANGCHAIN_AVAILABLE = True
 
 
 def _extract_fallback_tool_call(error_str: str) -> tuple[str | None, dict | None]:
-    match = re.search(r"'<function=(\w+)\s+(\{.*?\})\s*</function>'", error_str)
+    """Parse Groq XML-style tool call từ error string. Hỗ trợ có/không có quotes."""
+    match = re.search(r"'?<function=(\w+)\s+(\{.*?\})\s*</function>'?", error_str)
     if match:
         tool_name = match.group(1)
         try:
@@ -157,7 +158,20 @@ def create_analyst_agent(tools: list):
 
     Args:
         tools: List LangChain tool objects. Thường là [query_sql, list_tables].
+
+    Raises:
+        RuntimeError: nếu langchain-groq không khả dụng.
     """
+    # Guard: kiểm tra langchain-groq có sẵn không
+    if not _LANGCHAIN_AVAILABLE:
+        raise RuntimeError(
+            "langchain-groq is required but not available. "
+            "Install: pip install langchain-groq"
+        )
+
+    from langchain_groq import ChatGroq
+    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
     system_prompt = _get_system_prompt()
     mode = "SmartCity/S3" if "vehicle_data" in system_prompt else "Local/DuckDB"
     log.info("Agent initialized in %s mode", mode)
@@ -179,18 +193,6 @@ def create_analyst_agent(tools: list):
     )
     def _invoke_llm(messages: list):
         return llm.invoke(messages)
-
-    # ── Fallback XML parser (Groq quirk) ──────────────────────────────────────
-    def _extract_fallback_tool_call(error_str: str) -> tuple[str | None, dict | None]:
-        match = re.search(r"'<function=(\w+)\s+(\{.*?\})\s*</function>'", error_str)
-        if match:
-            tool_name = match.group(1)
-            try:
-                tool_args = json.loads(match.group(2))
-                return tool_name, tool_args
-            except json.JSONDecodeError:
-                pass
-        return None, None
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     def run_agent(user_input: str) -> str:
@@ -258,7 +260,11 @@ def create_analyst_agent(tools: list):
                         "latency_ms": elapsed_ms,
                     },
                 )
-                return response.content
+                # Trả fallback nếu content rỗng
+                content = response.content
+                if not content or not content.strip():
+                    return "Xin lỗi, không có phản hồi từ model. Vui lòng thử lại."
+                return content
 
             # ── Execute tool calls ────────────────────────────────────────────
             for tc in response.tool_calls:
