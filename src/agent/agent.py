@@ -131,6 +131,23 @@ def _is_rate_limit(exc: Exception) -> bool:
     )
 
 
+# Aliases for testability
+_is_rate_limit_error = _is_rate_limit
+_LANGCHAIN_AVAILABLE = True
+
+
+def _extract_fallback_tool_call(error_str: str) -> tuple[str | None, dict | None]:
+    match = re.search(r"'<function=(\w+)\s+(\{.*?\})\s*</function>'", error_str)
+    if match:
+        tool_name = match.group(1)
+        try:
+            tool_args = json.loads(match.group(2))
+            return tool_name, tool_args
+        except json.JSONDecodeError:
+            pass
+    return None, None
+
+
 # ── Agent factory ─────────────────────────────────────────────────────────────
 
 
