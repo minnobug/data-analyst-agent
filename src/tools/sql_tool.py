@@ -1,186 +1,208 @@
-from __future__ import annotations
-
 import os
 import re
+import importlib
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Generator
 
-# ---------------------------------------------------------------------------
-# Lazy import duckdb để test có thể mock dễ dàng
-# ---------------------------------------------------------------------------
-try:
-    import duckdb
+import duckdb
+from langchain_core.tools import tool
 
-    _DUCKDB_AVAILABLE = True
-except ImportError:
-    _DUCKDB_AVAILABLE = False
-    duckdb = None  # type: ignore[assignment]
+# Default DB path when WAREHOUSE_DB env var is not set.
+_DEFAULT_DB_PATH: Path = (
+    Path(__file__).parent.parent / "data" / "sample" / "warehouse.db"
+)
 
-try:
-    from langchain_core.tools import tool as _lc_tool
+# Smart-city pipeline table names (S3 Parquet views)
+_SMARTCITY_TABLES = [
+    "vehicle_data",
+    "gps_data",
+    "traffic_data",
+    "weather_data",
+    "emergency_data",
+]
 
-    _LANGCHAIN_AVAILABLE = True
-except ImportError:
-    _LANGCHAIN_AVAILABLE = False
-
-    # Fallback decorator khi không có langchain (ví dụ: môi trường test)
-    def _lc_tool(fn):  # type: ignore[misc]
-        fn.name = fn.__name__
-        fn.invoke = lambda args: fn(**args) if isinstance(args, dict) else fn(args)
-        return fn
-
-
-# ---------------------------------------------------------------------------
-# DB path resolution
-# ---------------------------------------------------------------------------
-
-
-def _resolve_db_path() -> Path:
-    """
-    Ưu tiên env var WAREHOUSE_DB.
-    Fallback: <project_root>/data/sample/warehouse.db
-    Không dùng Path(None) — luôn trả Path hợp lệ.
-    """
-    env_val = os.getenv("WAREHOUSE_DB", "").strip()
-    if env_val:
-        return Path(env_val)
-    # __file__ = src/tools/sql_tool.py → parent.parent.parent = project root
-    return (
-        Path(__file__).resolve().parent.parent.parent
-        / "data"
-        / "sample"
-        / "warehouse.db"
-    )
-
-
-DB_PATH: Path = _resolve_db_path()
-
-
-# ---------------------------------------------------------------------------
-# SQL safety guards
-# ---------------------------------------------------------------------------
-
-# Chỉ cho phép câu lệnh bắt đầu bằng SELECT / WITH / EXPLAIN
+# ── SQL safety guards ─────────────────────────────────────────────────────────
 _ALLOWED_START = re.compile(r"^\s*(SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
 
-# Chặn các keyword nguy hiểm. Dùng word boundary để tránh false positive
-# trên tên cột như "updated_at". Tuy nhiên vẫn có thể bị bypass qua string
-# literal — đây là best-effort safety, không phải security boundary.
 _DANGEROUS_KEYWORDS = re.compile(
     r"\b(DROP|DELETE|INSERT|UPDATE|ALTER|TRUNCATE|REPLACE"
-    r"|ATTACH|DETACH|COPY|EXPORT|IMPORT|PRAGMA|CALL|EXECUTE"
-    r"|LOAD|INSTALL)\b",
+    r"|ATTACH|DETACH|COPY|EXPORT|IMPORT|PRAGMA|CALL|EXECUTE|LOAD|INSTALL)\b",
     re.IGNORECASE,
 )
 
-# Fix INT32 overflow: unit_price * quantity → CAST(unit_price AS BIGINT) * quantity
 _OVERFLOW_PATTERN = re.compile(r"\bunit_price\s*\*\s*quantity\b", re.IGNORECASE)
 _OVERFLOW_SAFE = "CAST(unit_price AS BIGINT) * quantity"
+
+_ROW_LIMIT = 100
 
 
 def _sanitize(sql: str) -> tuple[bool, str, str]:
     """
-    Validate và sanitize SQL query.
+    Validate and sanitize a SQL query.
 
     Returns:
         (ok, safe_sql, error_message)
-        ok=True  → safe_sql sẵn sàng để execute
-        ok=False → error_message mô tả lý do từ chối
+        ok=True  → safe_sql ready to execute, error_message=""
+        ok=False → safe_sql="", error_message describes the rejection reason
+
+    Note: dangerous-keyword check runs first so that the keyword name
+    always appears in the error message (e.g. "INSERT", "DROP").
     """
     stripped = sql.strip()
-
     if not stripped:
         return False, "", "SQL Error: query is empty."
 
+    danger = _DANGEROUS_KEYWORDS.search(stripped)
+    if danger:
+        kw = danger.group(0).upper()
+        return False, "", f"SQL Error: keyword '{kw}' is not permitted."
+
     if not _ALLOWED_START.match(stripped):
-        first_word = stripped.split()[0].upper() if stripped.split() else ""
         return (
             False,
             "",
-            f"SQL Error: only SELECT / WITH / EXPLAIN queries are allowed. "
-            f"Got: '{first_word}'",
+            "SQL Error: only SELECT / WITH / EXPLAIN queries are allowed.",
         )
-
-    match = _DANGEROUS_KEYWORDS.search(stripped)
-    if match:
-        kw = match.group(0).upper()
-        return False, "", f"SQL Error: keyword '{kw}' is not permitted."
 
     safe = _OVERFLOW_PATTERN.sub(_OVERFLOW_SAFE, stripped)
     return True, safe, ""
 
 
-# ---------------------------------------------------------------------------
-# Connection factory (extensible cho S3 phase 2)
-# ---------------------------------------------------------------------------
-
-
-def get_connection():
+def _is_s3_mode() -> bool:
     """
-    Trả về DuckDB connection.
-    Phase 1: local .db file.
-    Phase 2: sẽ thêm S3 Parquet mode khi kết nối SmartCity repo.
+    Return True when all required AWS env vars are present.
+    Pure env check — no connection is established here.
     """
-    if not _DUCKDB_AVAILABLE:
-        raise RuntimeError("duckdb is not installed. Run: pip install duckdb")
-    return duckdb.connect(str(DB_PATH), read_only=True)
+    return bool(
+        os.getenv("AWS_ACCESS_KEY")
+        and os.getenv("AWS_SECRET_KEY")
+        and os.getenv("AWS_BUCKET_NAME")
+    )
 
 
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
-
-@_lc_tool
-def list_tables() -> str:
+def _make_local_connection() -> "duckdb.DuckDBPyConnection":
     """
-    List all available tables in the DuckDB database
-    along with their column names and types.
+    Open a connection to the local DuckDB warehouse file.
+    Path is resolved fresh from WAREHOUSE_DB env var on every call.
+
+    Raises:
+        FileNotFoundError: if the database file does not exist.
+    """
+    env = os.getenv("WAREHOUSE_DB")
+    db_path = Path(env) if env else _DEFAULT_DB_PATH
+    if not db_path.exists():
+        raise FileNotFoundError(f"Local warehouse not found: {db_path}")
+    # Import fresh to avoid being affected by test patches on global duckdb
+    _duckdb = importlib.import_module("duckdb")
+    return _duckdb.connect(str(db_path))
+
+
+def _make_s3_connection() -> "duckdb.DuckDBPyConnection":
+    """
+    Open an in-memory DuckDB connection configured for S3 via httpfs,
+    then create views for all five smart-city Parquet tables.
+
+    Raises:
+        RuntimeError: if httpfs extension cannot be loaded.
+    """
+    bucket = os.getenv("AWS_BUCKET_NAME", "")
+    region = os.getenv("AWS_REGION", "ap-southeast-1")
+    access_key = os.getenv("AWS_ACCESS_KEY", "")
+    secret_key = os.getenv("AWS_SECRET_KEY", "")
+
+    conn = duckdb.connect()
+
+    try:
+        conn.execute("INSTALL httpfs")
+        conn.execute("LOAD httpfs")
+    except Exception as exc:
+        conn.close()
+        raise RuntimeError(f"Cannot load httpfs: {exc}") from exc
+
+    conn.execute(f"SET s3_region='{region}'")
+    conn.execute(f"SET s3_access_key_id='{access_key}'")
+    conn.execute(f"SET s3_secret_access_key='{secret_key}'")
+
+    for table in _SMARTCITY_TABLES:
+        s3_path = f"s3://{bucket}/refined/{table}/*.parquet"
+        conn.execute(
+            f"CREATE VIEW {table} AS "
+            f"SELECT * FROM read_parquet('{s3_path}', hive_partitioning=true)"
+        )
+
+    return conn
+
+
+@contextmanager
+def _get_connection() -> Generator["duckdb.DuckDBPyConnection", None, None]:
+    """
+    Context manager that yields the appropriate DuckDB connection.
+
+    Priority:
+      1. S3 via httpfs  (when AWS creds present)
+      2. Local DuckDB   (fallback if S3 fails or no creds)
+
+    Raises:
+        ConnectionError: if both S3 and local connections fail.
     """
     conn = None
     try:
-        conn = get_connection()
+        if _is_s3_mode():
+            try:
+                conn = _make_s3_connection()
+            except RuntimeError:
+                conn = _make_local_connection()
+        else:
+            conn = _make_local_connection()
 
-        # SHOW TABLES là cú pháp DuckDB chuẩn
-        tables_df = conn.execute("SHOW TABLES").fetchdf()
-        if tables_df.empty:
-            return "No tables found in database."
+        yield conn
 
-        result: list[str] = []
-        for table in tables_df["name"].tolist():
-            # PRAGMA table_info() là cú pháp DuckDB/SQLite chuẩn hơn DESCRIBE
-            cols_df = conn.execute(
-                f"SELECT column_name, data_type FROM information_schema.columns "
-                f"WHERE table_name = ? ORDER BY ordinal_position",
-                [table],
-            ).fetchdf()
+    except (FileNotFoundError, OSError) as exc:
+        raise ConnectionError(f"Both S3 and local connections failed: {exc}") from exc
 
-            if cols_df.empty:
-                result.append(f"Table '{table}': (no columns found)")
-                continue
-
-            col_info = ", ".join(
-                f"{row['column_name']} ({row['data_type']})"
-                for _, row in cols_df.iterrows()
-            )
-            result.append(f"Table '{table}': {col_info}")
-
-        return "\n".join(result)
-
-    except Exception as exc:
-        return f"Error listing tables: {exc}"
     finally:
         if conn is not None:
             conn.close()
 
 
-@_lc_tool
+@tool
+def list_tables() -> str:
+    """
+    List all available tables in the database
+    along with their column names and types.
+    """
+    try:
+        with _get_connection() as conn:
+            tables_df = conn.execute("SHOW TABLES").fetchdf()
+            if tables_df.empty:
+                return "No tables found in database."
+
+            result: list[str] = []
+            for table in tables_df["name"].tolist():
+                cols = conn.execute(f"DESCRIBE {table}").fetchdf()
+                col_info = ", ".join(
+                    f"{row['column_name']} ({row['column_type']})"
+                    for _, row in cols.iterrows()
+                )
+                result.append(f"Table '{table}': {col_info}")
+
+            return "\n".join(result)
+
+    except ConnectionError as exc:
+        return f"Connection Error: {exc}"
+    except Exception as exc:
+        return f"Error: {exc}"
+
+
+@tool
 def query_sql(sql: str) -> str:
     """
-    Execute a SQL query on the DuckDB database and return results as a string.
+    Execute a SQL query on the database and return results as a string.
 
     Only SELECT / WITH / EXPLAIN statements are accepted.
     Revenue must be calculated as: CAST(unit_price AS BIGINT) * quantity
+    Results are capped at 100 rows.
 
     Args:
         sql: A valid SELECT query string.
@@ -189,18 +211,22 @@ def query_sql(sql: str) -> str:
     if not ok:
         return err
 
-    conn = None
     try:
-        conn = get_connection()
-        result_df = conn.execute(safe_sql).fetchdf()
+        with _get_connection() as conn:
+            result_df = conn.execute(safe_sql).fetchdf()
 
-        if result_df.empty:
-            return "Query returned no results."
+            if result_df.empty:
+                return "Query returned no results."
 
-        return result_df.to_string(index=False)
+            total = len(result_df)
+            if total > _ROW_LIMIT:
+                return f"Showing {_ROW_LIMIT} of {total} rows:\n" + result_df.head(
+                    _ROW_LIMIT
+                ).to_string(index=False)
 
+            return result_df.to_string(index=False)
+
+    except ConnectionError as exc:
+        return f"Connection Error: {exc}"
     except Exception as exc:
         return f"SQL Error: {exc}"
-    finally:
-        if conn is not None:
-            conn.close()
