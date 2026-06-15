@@ -15,6 +15,8 @@ from tenacity import (
 )
 
 from src.logging_config import get_logger
+from langchain_groq import ChatGroq
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 load_dotenv()
 
@@ -168,9 +170,6 @@ def create_analyst_agent(tools: list):
             "langchain-groq is required but not available. "
             "Install: pip install langchain-groq"
         )
-
-    from langchain_groq import ChatGroq
-    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
     system_prompt = _get_system_prompt()
     mode = "SmartCity/S3" if "vehicle_data" in system_prompt else "Local/DuckDB"
