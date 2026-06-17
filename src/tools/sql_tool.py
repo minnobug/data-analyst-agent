@@ -22,7 +22,7 @@ _SMARTCITY_TABLES = [
     "emergency_data",
 ]
 
-# ── SQL safety guards ─────────────────────────────────────────────────────────
+# SQL safety guards
 _ALLOWED_START = re.compile(r"^\s*(SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
 
 _DANGEROUS_KEYWORDS = re.compile(
@@ -38,17 +38,6 @@ _ROW_LIMIT = 100
 
 
 def _sanitize(sql: str) -> tuple[bool, str, str]:
-    """
-    Validate and sanitize a SQL query.
-
-    Returns:
-        (ok, safe_sql, error_message)
-        ok=True  → safe_sql ready to execute, error_message=""
-        ok=False → safe_sql="", error_message describes the rejection reason
-
-    Note: dangerous-keyword check runs first so that the keyword name
-    always appears in the error message (e.g. "INSERT", "DROP").
-    """
     stripped = sql.strip()
     if not stripped:
         return False, "", "SQL Error: query is empty."
@@ -70,10 +59,6 @@ def _sanitize(sql: str) -> tuple[bool, str, str]:
 
 
 def _is_s3_mode() -> bool:
-    """
-    Return True when all required AWS env vars are present.
-    Pure env check — no connection is established here.
-    """
     return bool(
         os.getenv("AWS_ACCESS_KEY")
         and os.getenv("AWS_SECRET_KEY")
@@ -82,13 +67,6 @@ def _is_s3_mode() -> bool:
 
 
 def _make_local_connection() -> "duckdb.DuckDBPyConnection":
-    """
-    Open a connection to the local DuckDB warehouse file.
-    Path is resolved fresh from WAREHOUSE_DB env var on every call.
-
-    Raises:
-        FileNotFoundError: if the database file does not exist.
-    """
     env = os.getenv("WAREHOUSE_DB")
     db_path = Path(env) if env else _DEFAULT_DB_PATH
     if not db_path.exists():
@@ -99,13 +77,6 @@ def _make_local_connection() -> "duckdb.DuckDBPyConnection":
 
 
 def _make_s3_connection() -> "duckdb.DuckDBPyConnection":
-    """
-    Open an in-memory DuckDB connection configured for S3 via httpfs,
-    then create views for all five smart-city Parquet tables.
-
-    Raises:
-        RuntimeError: if httpfs extension cannot be loaded.
-    """
     bucket = os.getenv("AWS_BUCKET_NAME", "")
     region = os.getenv("AWS_REGION", "ap-southeast-1")
     access_key = os.getenv("AWS_ACCESS_KEY", "")
@@ -125,7 +96,7 @@ def _make_s3_connection() -> "duckdb.DuckDBPyConnection":
     conn.execute(f"SET s3_secret_access_key='{secret_key}'")
 
     for table in _SMARTCITY_TABLES:
-        s3_path = f"s3://{bucket}/refined/{table}/*.parquet"
+        s3_path = f"s3://{bucket}/refined/{table}/**/*.parquet"
         conn.execute(
             f"CREATE VIEW {table} AS "
             f"SELECT * FROM read_parquet('{s3_path}', hive_partitioning=true)"
@@ -136,16 +107,6 @@ def _make_s3_connection() -> "duckdb.DuckDBPyConnection":
 
 @contextmanager
 def _get_connection() -> Generator["duckdb.DuckDBPyConnection", None, None]:
-    """
-    Context manager that yields the appropriate DuckDB connection.
-
-    Priority:
-      1. S3 via httpfs  (when AWS creds present)
-      2. Local DuckDB   (fallback if S3 fails or no creds)
-
-    Raises:
-        ConnectionError: if both S3 and local connections fail.
-    """
     conn = None
     try:
         if _is_s3_mode():
@@ -168,10 +129,6 @@ def _get_connection() -> Generator["duckdb.DuckDBPyConnection", None, None]:
 
 @tool
 def list_tables() -> str:
-    """
-    List all available tables in the database
-    along with their column names and types.
-    """
     try:
         with _get_connection() as conn:
             tables_df = conn.execute("SHOW TABLES").fetchdf()
@@ -197,16 +154,6 @@ def list_tables() -> str:
 
 @tool
 def query_sql(sql: str) -> str:
-    """
-    Execute a SQL query on the database and return results as a string.
-
-    Only SELECT / WITH / EXPLAIN statements are accepted.
-    Revenue must be calculated as: CAST(unit_price AS BIGINT) * quantity
-    Results are capped at 100 rows.
-
-    Args:
-        sql: A valid SELECT query string.
-    """
     ok, safe_sql, err = _sanitize(sql)
     if not ok:
         return err
