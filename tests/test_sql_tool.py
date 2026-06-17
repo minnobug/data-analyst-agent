@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch, call
 import pandas as pd
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# Helpers
 
 
 def _make_mock_conn(
@@ -27,7 +27,7 @@ def _make_mock_conn(
     return conn
 
 
-# ── _is_s3_mode ───────────────────────────────────────────────────────────────
+# _is_s3_mode
 
 
 class TestIsS3Mode:
@@ -67,7 +67,7 @@ class TestIsS3Mode:
         assert m._is_s3_mode() is False
 
 
-# ── _sanitize ─────────────────────────────────────────────────────────────────
+# _sanitize
 
 
 class TestSanitize:
@@ -153,7 +153,7 @@ class TestSanitize:
         assert ok is False  # conservative: block anyway
 
 
-# ── _make_local_connection ────────────────────────────────────────────────────
+# _make_local_connection
 
 
 class TestMakeLocalConnection:
@@ -198,7 +198,7 @@ class TestMakeLocalConnection:
         conn.close()
 
 
-# ── _make_s3_connection ───────────────────────────────────────────────────────
+# _make_s3_connection
 
 
 class TestMakeS3Connection:
@@ -274,7 +274,7 @@ class TestMakeS3Connection:
                 assert any(table in c for c in view_calls)
 
 
-# ── _get_connection context manager ──────────────────────────────────────────
+# _get_connection context manager
 
 
 class TestGetConnection:
@@ -369,7 +369,7 @@ class TestGetConnection:
                         pass
 
 
-# ── list_tables tool ──────────────────────────────────────────────────────────
+# list_tables tool
 
 
 class TestListTables:
@@ -453,7 +453,7 @@ class TestListTables:
         assert "Connection Error" in result or "Error" in result
 
 
-# ── query_sql tool ────────────────────────────────────────────────────────────
+# query_sql tool
 
 
 class TestQuerySql:
@@ -524,12 +524,15 @@ class TestQuerySql:
         assert any("CAST(unit_price AS BIGINT)" in s for s in executed_sql)
 
     def test_row_limit_100(self):
-        # 150 rows → only show 100
+        # 150 rows → only show _ROW_LIMIT rows (was hard-coded to 100;
+        # now reads the live constant so this test tracks any future
+        # change to _ROW_LIMIT instead of silently going stale)
+        limit = self.m._ROW_LIMIT
         df = pd.DataFrame({"n": range(150)})
         with patch.object(self.m, "_get_connection", return_value=self._patch_conn(df)):
             result = self.m.query_sql.invoke({"sql": "SELECT n FROM big_table"})
         assert "150" in result  # mentions total count
-        assert "100" in result  # mentions limit
+        assert str(limit) in result  # mentions the actual configured limit
 
     def test_sql_exception_returns_error_string(self):
         mock_conn = MagicMock()
@@ -555,7 +558,7 @@ class TestQuerySql:
         assert "Connection Error" in result
 
 
-# ── _SMARTCITY_TABLES constant ────────────────────────────────────────────────
+#  _SMARTCITY_TABLES constant
 
 
 class TestSmartCityTablesConstant:

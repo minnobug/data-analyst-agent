@@ -26,7 +26,7 @@ _SMARTCITY_TABLES = [
     "emergency_data",
 ]
 
-# ── SQL safety guards ─────────────────────────────────────────────────────────
+# SQL safety guards
 _ALLOWED_START = re.compile(r"^\s*(SELECT|WITH|EXPLAIN)\b", re.IGNORECASE)
 
 _DANGEROUS_KEYWORDS = re.compile(
@@ -38,7 +38,16 @@ _DANGEROUS_KEYWORDS = re.compile(
 _OVERFLOW_PATTERN = re.compile(r"\bunit_price\s*\*\s*quantity\b", re.IGNORECASE)
 _OVERFLOW_SAFE = "CAST(unit_price AS BIGINT) * quantity"
 
-_ROW_LIMIT = 100
+# Lowered from 100 → 20. Groq free tier caps at 12,000 tokens/minute;
+# 100 rows of wide tables (14 columns) routinely pushed a single tool
+# result past 2,000+ tokens, and with system prompt + message history
+# this triggered HTTP 413 "tokens per minute" errors mid-conversation.
+_ROW_LIMIT = 20
+
+# Cap on characters returned by list_tables — DESCRIBE on 5 wide tables
+# was another major contributor to the 413 errors, since the agent calls
+# list_tables on nearly every request per the system prompt's QUERY RULES.
+_LIST_TABLES_CHAR_LIMIT = 1200
 
 
 def _sanitize(sql: str) -> tuple[bool, str, str]:
@@ -155,7 +164,7 @@ def _make_s3_connection() -> "duckdb.DuckDBPyConnection":
             f"SELECT * FROM read_parquet('{s3_path}', hive_partitioning=true)"
         )
 
-    # ── Validate refined data actually exists ───────────────────────────────
+    # Validate refined data actually exists
     # read_parquet() is lazy: CREATE VIEW above succeeds even if the S3
     # prefix is empty. Probe one table now so an empty pipeline triggers
     # RuntimeError → fallback to local, instead of a confusing IO error
@@ -229,7 +238,16 @@ def list_tables() -> str:
                 )
                 result.append(f"Table '{table}': {col_info}")
 
-            return "\n".join(result)
+            output = "\n".join(result)
+
+            # Token-budget guard: DESCRIBE on 5 wide tables can exceed
+            # 1000+ tokens on its own. The agent calls list_tables on
+            # almost every request (per system prompt), so this single
+            # tool result was a major contributor to 413 TPM errors.
+            if len(output) > _LIST_TABLES_CHAR_LIMIT:
+                output = output[:_LIST_TABLES_CHAR_LIMIT] + "\n...(truncated)"
+
+            return output
 
     except ConnectionError as exc:
         return f"Connection Error: {exc}"
@@ -244,7 +262,8 @@ def query_sql(sql: str) -> str:
 
     Only SELECT / WITH / EXPLAIN statements are accepted.
     Revenue must be calculated as: CAST(unit_price AS BIGINT) * quantity
-    Results are capped at 100 rows.
+    Results are capped at 20 rows — write aggregate queries (COUNT, AVG,
+    GROUP BY) rather than relying on this tool to summarize raw rows.
 
     Args:
         sql: A valid SELECT query string.
@@ -262,9 +281,11 @@ def query_sql(sql: str) -> str:
 
             total = len(result_df)
             if total > _ROW_LIMIT:
-                return f"Showing {_ROW_LIMIT} of {total} rows:\n" + result_df.head(
-                    _ROW_LIMIT
-                ).to_string(index=False)
+                return (
+                    f"Showing {_ROW_LIMIT} of {total} rows "
+                    f"(narrow your query with WHERE/GROUP BY/LIMIT for full data):\n"
+                    + result_df.head(_ROW_LIMIT).to_string(index=False)
+                )
 
             return result_df.to_string(index=False)
 

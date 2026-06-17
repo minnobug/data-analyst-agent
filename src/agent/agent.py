@@ -15,8 +15,6 @@ from tenacity import (
 )
 
 from src.logging_config import get_logger
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
 load_dotenv()
 
@@ -25,7 +23,23 @@ log = get_logger("agent")
 
 MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "5"))
 
-# ── System prompts ────────────────────────────────────────────────────────────
+# Optional langchain imports (module level, so they can be patched)
+# Moved to module scope — previously these were imported inside
+# create_analyst_agent(), which meant `patch("src.agent.agent.ChatGroq", ...)`
+# raised AttributeError because the attribute didn't exist on the module
+# until the function actually ran.
+try:
+    from langchain_groq import ChatGroq
+    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+
+    _LANGCHAIN_AVAILABLE = True
+except ImportError:
+    ChatGroq = None  # type: ignore[assignment]
+    HumanMessage = SystemMessage = ToolMessage = None  # type: ignore[assignment]
+    _LANGCHAIN_AVAILABLE = False
+
+
+# System prompts
 
 _SYSTEM_PROMPT_SMARTCITY = """You are a Data Analyst assistant for the Smart City pipeline \
 (HCM → Vũng Tàu expressway). You analyze real-time IoT data using SQL.
@@ -73,12 +87,21 @@ TABLE SCHEMAS:
 
 QUERY RULES:
 - ALWAYS call list_tables first to confirm available columns before querying
-- Filter by date partition when possible for performance: WHERE date = '2024-01-15'
+- The "date" column is a VARCHAR partition key in 'YYYY-MM-DD' format (e.g. '2026-06-17'),
+  NOT a DATE type. NEVER compare it to CURRENT_DATE directly — that comparison can
+  silently fail or behave unpredictably across DuckDB versions.
+  ALWAYS write: WHERE date = CAST(CURRENT_DATE AS VARCHAR)
+  or, for a specific day: WHERE date = '2026-06-17'
+- If a query for "today" / "hôm nay" returns 0 rows, do NOT immediately conclude
+  there is no data — re-run with WHERE date = (SELECT MAX(date) FROM <table>)
+  to check the most recent available date, and tell the user which date you used.
 - For EV queries: WHERE is_ev = true  OR  WHERE fuelType = 'Electric'
 - For real incidents only: WHERE is_real_incident = true AND type != 'None'
 - Aggregate speed with AVG(speed_kmh) not AVG(speed)
 - JOIN vehicle_data and weather_data on vehicle_id AND date
 - NEVER use columns that don't exist in the schema above
+- PREFER aggregate queries (COUNT, AVG, SUM, GROUP BY) over SELECT * — raw row
+  dumps are expensive and get truncated by query_sql's row limit
 - Respond in the same language as the user (Vietnamese if user writes Vietnamese)
 - Format numbers clearly: use ROUND() for decimals, format large numbers readably"""
 
@@ -113,7 +136,7 @@ def _get_system_prompt() -> str:
     return _SYSTEM_PROMPT_SMARTCITY if has_aws else _SYSTEM_PROMPT_LOCAL
 
 
-# ── Rate limit handling ───────────────────────────────────────────────────────
+# Rate limit handling
 
 try:
     from groq import RateLimitError as _GroqRateLimitError
@@ -135,7 +158,6 @@ def _is_rate_limit(exc: Exception) -> bool:
 
 # Aliases for testability
 _is_rate_limit_error = _is_rate_limit
-_LANGCHAIN_AVAILABLE = True
 
 
 def _extract_fallback_tool_call(error_str: str) -> tuple[str | None, dict | None]:
@@ -151,7 +173,7 @@ def _extract_fallback_tool_call(error_str: str) -> tuple[str | None, dict | None
     return None, None
 
 
-# ── Agent factory ─────────────────────────────────────────────────────────────
+# Agent factory
 
 
 def create_analyst_agent(tools: list):
@@ -183,7 +205,7 @@ def create_analyst_agent(tools: list):
 
     tool_map: dict = {t.name: t for t in tools}
 
-    # ── Retry wrapper ─────────────────────────────────────────────────────────
+    # Retry wrapper
     @retry(
         stop=stop_after_attempt(3),
         wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -193,7 +215,7 @@ def create_analyst_agent(tools: list):
     def _invoke_llm(messages: list):
         return llm.invoke(messages)
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+    # Main loop
     def run_agent(user_input: str) -> str:
         req_id = str(uuid.uuid4())[:8]
         t_start = time.perf_counter()
@@ -209,7 +231,7 @@ def create_analyst_agent(tools: list):
         ]
 
         for step in range(MAX_STEPS):
-            # ── LLM call ─────────────────────────────────────────────────────
+            # LLM call
             try:
                 response = _invoke_llm(messages)
             except RetryError as exc:
@@ -248,7 +270,7 @@ def create_analyst_agent(tools: list):
 
             messages.append(response)
 
-            # ── Final answer ──────────────────────────────────────────────────
+            # Final answer
             if not response.tool_calls:
                 elapsed_ms = round((time.perf_counter() - t_start) * 1000)
                 log.info(
@@ -265,7 +287,7 @@ def create_analyst_agent(tools: list):
                     return "Xin lỗi, không có phản hồi từ model. Vui lòng thử lại."
                 return content
 
-            # ── Execute tool calls ────────────────────────────────────────────
+            # Execute tool calls
             for tc in response.tool_calls:
                 t_name: str = tc["name"]
                 t_args: dict = tc["args"]
