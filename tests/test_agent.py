@@ -425,6 +425,13 @@ class TestFallbackXmlParsing(unittest.TestCase):
         self.assertEqual(name, "list_tables")
         self.assertEqual(args, {})
 
+    def test_no_space_before_brace(self):
+        """Groq đôi khi không có khoảng trắng giữa tên function và '{'."""
+        err = '<function=query_sql{"sql": "SELECT 1"}</function>'
+        name, args = self.fn(err)
+        self.assertEqual(name, "query_sql")
+        self.assertEqual(args, {"sql": "SELECT 1"})
+
     def test_extra_whitespace_handled(self):
         err = '<function=query_sql   {"sql": "SELECT 1"}  </function>'
         name, args = self.fn(err)

@@ -162,7 +162,7 @@ _is_rate_limit_error = _is_rate_limit
 
 def _extract_fallback_tool_call(error_str: str) -> tuple[str | None, dict | None]:
     """Parse Groq XML-style tool call từ error string. Hỗ trợ có/không có quotes."""
-    match = re.search(r"'?<function=(\w+)\s+(\{.*?\})\s*</function>'?", error_str)
+    match = re.search(r"'?<function=(\w+)\s*(\{.*?\})\s*</function>'?", error_str)
     if match:
         tool_name = match.group(1)
         try:
